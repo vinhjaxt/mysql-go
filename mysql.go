@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ type Config struct {
 	Database string `json:"database"`
 
 	// Optional.
-	Username string `json:"username"`
+	User     string `json:"user"`
 	Password string `json:"password"`
 
 	// Host of the MySQL instance.
@@ -61,7 +62,8 @@ func (config *Config) ensureDatabaseSchema() error {
 			"could be bad address, or this address is not whitelisted for access.")
 	}
 
-	if _, err := conn.Exec("USE " + EscapeID(config.Database, true)); err != nil {
+	_, err = conn.Exec("USE " + EscapeID(config.Database, true))
+	if err != nil {
 		// MySQL error 1049 is "database does not exist"
 		if mErr, ok := err.(*MySQL.MySQLError); ok && mErr.Number == 1049 {
 			return config.createDatabaseSchema(conn)
@@ -71,10 +73,9 @@ func (config *Config) ensureDatabaseSchema() error {
 	return nil
 }
 
-// createTable creates the table, and if necessary, the database.
 func (config *Config) createDatabaseSchema(conn *sql.DB) error {
 	createTableStatements := []string{
-		`CREATE DATABASE IF NOT EXISTS ` + EscapeID(config.Database, true) + ` DEFAULT CHARACTER SET = 'utf8' DEFAULT COLLATE 'utf8_general_ci';`,
+		`CREATE DATABASE IF NOT EXISTS ` + EscapeID(config.Database, true) + ` DEFAULT CHARACTER SET = 'utf8mb4' DEFAULT COLLATE 'utf8mb4_unicode_ci';`,
 		`USE ` + EscapeID(config.Database, true) + `;`,
 	}
 	for _, stmt := range createTableStatements {
@@ -89,9 +90,9 @@ func (config *Config) createDatabaseSchema(conn *sql.DB) error {
 // dataStoreName returns a connection string suitable for sql.Open.
 func (config *Config) dataStoreName(databaseName string) string {
 	var cred string
-	// [username[:password]@]
-	if config.Username != "" {
-		cred = config.Username
+	// [user[:password]@]
+	if config.User != "" {
+		cred = config.User
 		if config.Password != "" {
 			cred = cred + ":" + config.Password
 		}
@@ -119,13 +120,10 @@ func New(config *Config) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("mysql: could not establish a good connection: %v", err)
 	}
-	conn.SetConnMaxLifetime(time.Minute * 5)
-	// maxConnectionCount := runtime.NumCPU() * 2
-	// conn.SetMaxIdleConns(maxConnectionCount)
-	// conn.SetMaxOpenConns(maxConnectionCount)
-	// conn.SetMaxIdleConns(16)
-	conn.SetMaxIdleConns(5)
-	conn.SetMaxOpenConns(5)
+	conn.SetConnMaxLifetime(time.Minute * 15)
+	maxConnectionCount := runtime.NumCPU() * 2
+	conn.SetMaxIdleConns(maxConnectionCount)
+	conn.SetMaxOpenConns(maxConnectionCount)
 	return &DB{
 		Conn: conn,
 	}, nil
@@ -133,157 +131,208 @@ func New(config *Config) (*DB, error) {
 
 // Single select one column in one rows
 // return sql.ErrNoRows if no row found
-func (db *DB) Single(sqlQuery string, values ...interface{}) (data sql.NullString, err error) {
+func (db *DB) Single(sqlQuery string, values ...interface{}) (*sql.NullString, error) {
+	data := new(sql.NullString)
 	row := db.Conn.QueryRow(sqlQuery, values...)
-	err = row.Scan(&data)
+	err := row.Scan(data)
 	if err != nil {
-		return
+		return nil, err
 	}
-	return
+	return data, nil
 }
 
 // Row select one row in table
-func (db *DB) Row(sqlQuery string, args ...interface{}) (res map[string]sql.RawBytes, err error) {
+func (db *DB) Row(sqlQuery string, args ...interface{}) (map[string]*sql.NullString, error) {
 	row, err := db.Conn.Query(sqlQuery, args...)
 	if err != nil {
-		return
+		return nil, err
 	}
 	defer row.Close()
-	if row.Next() {
-		var columns []string
-		// Get column names
-		columns, err = row.Columns()
-		if err != nil {
-			return
-		}
-		values := make([]sql.RawBytes, len(columns))
-		// row.Scan wants '[]interface{}' as an argument, so we must copy the
-		// references into such a slice
-		// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
-		scanArgs := make([]interface{}, len(values))
-		for i := range values {
-			scanArgs[i] = &values[i]
-		}
 
-		// get RawBytes from data
-		err = row.Scan(scanArgs...)
-		if err != nil {
-			return
-		}
-		// Now do something with the data.
-		// Here we just print each column as a string.
-		res = map[string]sql.RawBytes{}
-		for i, col := range values {
-			// Here we can check if the value is nil (NULL value)
-			res[columns[i]] = col
-		}
-
-		// hihi
-		// row.Next()
+	if row.Next() == false {
+		return nil, nil // no row found
 	}
-	return
+
+	var columns []string
+	// Get column names
+	columns, err = row.Columns()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]sql.NullString, len(columns))
+	// row.Scan wants '[]interface{}' as an argument, so we must copy the
+	// references into such a slice
+	// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
+	scanArgs := make([]interface{}, len(values))
+	res := make(map[string]*sql.NullString)
+	for i := range values {
+		value := &values[i]
+		scanArgs[i] = value
+		res[columns[i]] = value
+	}
+	err = row.Scan(scanArgs...)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+	// row.Next()
 }
 
 // Rows select rows in table
-func (db *DB) Rows(sqlQuery string, args ...interface{}) (res []map[string]sql.RawBytes, err error) {
+func (db *DB) Rows(sqlQuery string, args ...interface{}) ([]map[string]*sql.NullString, error) {
 	rows, err := db.Conn.Query(sqlQuery, args...)
 	if err != nil {
-		return
+		return nil, err
 	}
 	defer rows.Close()
 
-	haveNextRow := rows.Next()
-	if haveNextRow {
-		var columns []string
-		// Get column names
-		columns, err = rows.Columns()
-		if err != nil {
-			return
-		}
-		values := make([]sql.RawBytes, len(columns))
+	if rows.Next() == false {
+		return nil, nil // no row found
+	}
+
+	var columns []string
+	// Get column names
+	columns, err = rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var ret []map[string]*sql.NullString
+
+	for {
+		values := make([]sql.NullString, len(columns))
 		// rows.Scan wants '[]interface{}' as an argument, so we must copy the
 		// references into such a slice
 		// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
+		row := make(map[string]*sql.NullString)
 		scanArgs := make([]interface{}, len(values))
 		for i := range values {
-			scanArgs[i] = &values[i]
+			value := &values[i]
+			scanArgs[i] = value
+			row[columns[i]] = value
 		}
+		err = rows.Scan(scanArgs...)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, row)
 
-		for haveNextRow {
-			// get RawBytes from data
-			row := make(map[string]sql.RawBytes)
-			err = rows.Scan(scanArgs...)
-			if err != nil {
-				return
-			}
-			// Now do something with the data.
-			// Here we just print each column as a string.
-			for i, col := range values {
-				// Here we can check if the value is nil (NULL value)
-				row[columns[i]] = col
-			}
-			res = append(res, row)
-
-			haveNextRow = rows.Next()
+		if rows.Next() == false {
+			break
 		}
 	}
-	return
+	return ret, nil
 }
 
-// SetRows select rows of each result sets
-func (db *DB) SetRows(sqlQuery string, args ...interface{}) (res [][]map[string]sql.RawBytes, err error) {
+// SetRows select rows of each result sets excludes nil set
+func (db *DB) SetRows(sqlQuery string, args ...interface{}) ([][]map[string]*sql.NullString, error) {
 	rows, err := db.Conn.Query(sqlQuery, args...)
 	if err != nil {
-		return
+		return nil, err
 	}
 	defer rows.Close()
+
+	var ret [][]map[string]*sql.NullString
 	var columns []string
+
 	for {
 		// for each sets
-
-		var resi []map[string]sql.RawBytes
-		haveNextRow := rows.Next()
-		if haveNextRow {
+		if rows.Next() {
+			var setRows []map[string]*sql.NullString
 			// Get column names
 			columns, err = rows.Columns()
 			if err != nil {
-				return
+				return nil, err
 			}
-			values := make([]sql.RawBytes, len(columns))
-			// rows.Scan wants '[]interface{}' as an argument, so we must copy the
-			// references into such a slice
-			// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
-			scanArgs := make([]interface{}, len(values))
-			for i := range values {
-				scanArgs[i] = &values[i]
-			}
+			columnsLength := len(columns)
+			if columnsLength > 0 {
+				for {
+					values := make([]sql.NullString, columnsLength)
+					// rows.Scan wants '[]interface{}' as an argument, so we must copy the
+					// references into such a slice
+					// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
+					scanArgs := make([]interface{}, columnsLength)
+					row := make(map[string]*sql.NullString)
+					for i := range values {
+						value := &values[i]
+						scanArgs[i] = value
+						row[columns[i]] = value
+					}
+					err = rows.Scan(scanArgs...)
+					if err != nil {
+						return nil, err
+					}
+					setRows = append(setRows, row)
 
-			for haveNextRow {
-				// get RawBytes from data
-				row := make(map[string]sql.RawBytes)
-				err = rows.Scan(scanArgs...)
-				if err != nil {
-					return
+					if rows.Next() == false {
+						break
+					}
 				}
-				// Now do something with the data.
-				// Here we just print each column as a string.
-				for i, col := range values {
-					// Here we can check if the value is nil (NULL value)
-					row[columns[i]] = col
-				}
-				resi = append(resi, row)
-
-				haveNextRow = rows.Next()
+				ret = append(ret, setRows)
 			}
 		}
-		res = append(res, resi)
-
 		// next set
 		if rows.NextResultSet() == false {
 			break
 		}
 	}
-	return
+
+	return ret, nil
+}
+
+// SetRowsNil select rows of each result sets includes nil set
+func (db *DB) SetRowsNil(sqlQuery string, args ...interface{}) ([][]map[string]*sql.NullString, error) {
+	rows, err := db.Conn.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ret [][]map[string]*sql.NullString
+	var columns []string
+
+	for {
+		// for each sets
+		var setRows []map[string]*sql.NullString
+		if rows.Next() {
+			// Get column names
+			columns, err = rows.Columns()
+			if err != nil {
+				return nil, err
+			}
+			columnsLength := len(columns)
+			if columnsLength > 0 {
+				for {
+					values := make([]sql.NullString, columnsLength)
+					// rows.Scan wants '[]interface{}' as an argument, so we must copy the
+					// references into such a slice
+					// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
+					scanArgs := make([]interface{}, columnsLength)
+					row := make(map[string]*sql.NullString)
+					for i := range values {
+						value := &values[i]
+						scanArgs[i] = value
+						row[columns[i]] = value
+					}
+					err = rows.Scan(scanArgs...)
+					if err != nil {
+						return nil, err
+					}
+					setRows = append(setRows, row)
+
+					if rows.Next() == false {
+						break
+					}
+				}
+			}
+		}
+		ret = append(ret, setRows)
+		// next set
+		if rows.NextResultSet() == false {
+			break
+		}
+	}
+
+	return ret, nil
 }
 
 // Insert into table
@@ -301,10 +350,10 @@ func (db *DB) Insert(table string, columns []string, data []interface{}) (insert
 }
 
 // InsertUpdate into table and update if existed
-func (db *DB) InsertUpdate(table string, columns []string, data []interface{}) (res sql.Result, err error) {
+func (db *DB) InsertUpdate(table string, columns []string, data []interface{}) (sql.Result, error) {
 	escapedData, err := Escape(data, false)
 	if err != nil {
-		return
+		return nil, err
 	}
 	colStr := ""
 	updateStr := ""
@@ -318,6 +367,7 @@ func (db *DB) InsertUpdate(table string, columns []string, data []interface{}) (
 		updateStr += escaped + "=values(" + escaped + ")"
 	}
 	sqlQuery := "insert " + EscapeID(table, false) + " (" + colStr + ") values " + escapedData + " ON DUPLICATE KEY UPDATE " + updateStr
+
 	return db.Conn.Exec(sqlQuery)
 }
 
@@ -391,9 +441,5 @@ func (db *DB) Query(sql string, values ...interface{}) (sql.Result, error) {
 		return nil, err
 	}
 	defer stmt.Close()
-	res, err := stmt.Exec(values...)
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
+	return stmt.Exec(values...)
 }

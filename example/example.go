@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	".."
+	mysql ".."
 )
 
 func main() {
@@ -44,12 +44,12 @@ func main() {
 
 	// Rows of Sets
 	log.Println(" >> Rows of Sets:")
-	resultSets, err := db.SetRows(`select null; select 1; select 2`) // enable MultiStatements to query this
+	resultSets, err := db.SetRowsNil(`select null; select 1; select 2`) // enable MultiStatements to query this
 	if err != nil {
 		log.Panicln(err)
 	}
 	for si, rows := range resultSets {
-		// It's OK to range over nil slices
+		// It's OK to range over nil setRows (slices)
 		for ri, row := range rows {
 			log.Printf("Row %d in set %d: %v", ri, si, row)
 		}
