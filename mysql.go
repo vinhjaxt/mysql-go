@@ -15,42 +15,24 @@ import (
 	MySQL "github.com/go-sql-driver/mysql"
 )
 
-// Config struct
-type Config struct {
-	// Database name
-	Database string `json:"database"`
-
-	// Optional.
-	User     string `json:"user"`
-	Password string `json:"password"`
-
-	// Host of the MySQL instance.
-	//
-	// If set, UnixSocket should be unset.
-	Host string `json:"host"`
-
-	// Port of the MySQL instance.
-	//
-	// If set, UnixSocket should be unset.
-	Port int `json:"port"`
-
-	// UnixSocket is the filepath to a unix socket.
-	//
-	// If set, Host and Port should be unset.
-	UnixSocket string `json:"unix-socket"`
-
-	// MultiStatements enable multiStatements
-	MultiStatements bool
-}
-
 // DB contains mysql connection and function
 type DB struct {
 	Conn *sql.DB
 }
 
+// Config fast config
+type Config struct {
+	User       string `json:"user"`
+	Passwd     string `json:"passwd"`
+	Host       string `json:"host"`
+	DBName     string `json:"db-name"`
+	Port       int    `json:"port"`
+	UnixSocket string `json:"unix-socket"`
+}
+
 // ensureDatabaseSchema checks the table exists. If not, it creates it.
-func (config *Config) ensureDatabaseSchema() error {
-	conn, err := sql.Open("mysql", config.dataStoreName(""))
+func ensureDatabaseSchema(config *MySQL.Config) error {
+	conn, err := sql.Open("mysql", config.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("mysql: could not get a connection: %v", err)
 	}
@@ -62,21 +44,21 @@ func (config *Config) ensureDatabaseSchema() error {
 			"could be bad address, or this address is not whitelisted for access.")
 	}
 
-	_, err = conn.Exec("USE " + EscapeID(config.Database, true))
+	_, err = conn.Exec("USE " + EscapeID(config.DBName, true))
 	if err != nil {
 		// MySQL error 1049 is "database does not exist"
 		if mErr, ok := err.(*MySQL.MySQLError); ok && mErr.Number == 1049 {
-			return config.createDatabaseSchema(conn)
+			return createDatabaseSchema(config, conn)
 		}
 	}
 
 	return nil
 }
 
-func (config *Config) createDatabaseSchema(conn *sql.DB) error {
+func createDatabaseSchema(config *MySQL.Config, conn *sql.DB) error {
 	createTableStatements := []string{
-		`CREATE DATABASE IF NOT EXISTS ` + EscapeID(config.Database, true) + ` DEFAULT CHARACTER SET = 'utf8mb4' DEFAULT COLLATE 'utf8mb4_unicode_ci';`,
-		`USE ` + EscapeID(config.Database, true) + `;`,
+		`CREATE DATABASE IF NOT EXISTS ` + EscapeID(config.DBName, true) + ` DEFAULT CHARACTER SET = 'utf8mb4' DEFAULT COLLATE 'utf8mb4_unicode_ci';`,
+		`USE ` + EscapeID(config.DBName, true) + `;`,
 	}
 	for _, stmt := range createTableStatements {
 		_, err := conn.Exec(stmt)
@@ -87,32 +69,38 @@ func (config *Config) createDatabaseSchema(conn *sql.DB) error {
 	return nil
 }
 
-// dataStoreName returns a connection string suitable for sql.Open.
-func (config *Config) dataStoreName(databaseName string) string {
-	var cred string
-	// [user[:password]@]
-	if config.User != "" {
-		cred = config.User
-		if config.Password != "" {
-			cred = cred + ":" + config.Password
+// NewConfig create new mysql config from fast config
+func NewConfig(config *Config) *MySQL.Config {
+	mysqlConfig := MySQL.NewConfig()
+	mysqlConfig.Collation = "utf8mb4_unicode_ci"
+	mysqlConfig.MultiStatements = true
+	mysqlConfig.Params = map[string]string{
+		"charset": "utf8mb4,utf8",
+	}
+	mysqlConfig.User = config.User
+	mysqlConfig.Passwd = config.Passwd
+	if len(config.UnixSocket) > 0 {
+		mysqlConfig.Net = "unix"
+		mysqlConfig.Addr = config.UnixSocket
+	} else {
+		mysqlConfig.Net = "tcp"
+		mysqlConfig.Addr = config.Host
+		if config.Port != 0 {
+			mysqlConfig.Addr += ":" + strconv.Itoa(config.Port)
 		}
-		cred = cred + "@"
 	}
-
-	if config.UnixSocket != "" {
-		return fmt.Sprintf("%sunix(%s)/%s?multiStatements="+strconv.FormatBool(config.MultiStatements), cred, config.UnixSocket, databaseName)
-	}
-	return fmt.Sprintf("%stcp([%s]:%d)/%s?multiStatements="+strconv.FormatBool(config.MultiStatements), cred, config.Host, config.Port, databaseName)
+	mysqlConfig.DBName = config.DBName
+	return mysqlConfig
 }
 
 // New create new mysql connection
-func New(config *Config) (*DB, error) {
+func New(config *MySQL.Config) (*DB, error) {
 	// Check database schema exists. If not, create it.
-	if err := config.ensureDatabaseSchema(); err != nil {
+	if err := ensureDatabaseSchema(config); err != nil {
 		return nil, err
 	}
 
-	conn, err := sql.Open("mysql", config.dataStoreName(config.Database))
+	conn, err := sql.Open("mysql", config.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("mysql: could not get a connection: %v", err)
 	}
@@ -120,7 +108,7 @@ func New(config *Config) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("mysql: could not establish a good connection: %v", err)
 	}
-	conn.SetConnMaxLifetime(time.Minute * 15)
+	conn.SetConnMaxLifetime(time.Hour)
 	maxConnectionCount := runtime.NumCPU() * 2
 	conn.SetMaxIdleConns(maxConnectionCount)
 	conn.SetMaxOpenConns(maxConnectionCount)
